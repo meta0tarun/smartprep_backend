@@ -45,4 +45,5 @@ def make_engine():
 
 # Create a session factory
 engine = make_engine()
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+# Removed unsupported `autocommit` kwarg (SQLAlchemy 2.x). Use future=True instead.
+SessionLocal = sessionmaker(bind=engine, autoflush=False, future=True)
