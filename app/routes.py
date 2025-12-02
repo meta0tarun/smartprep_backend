@@ -1,144 +1,87 @@
 # app/routes.py
 import os
+import uuid
+import shutil
+import logging
 from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
 from fastapi.responses import JSONResponse
-from sqlalchemy.orm import Session
-from .db import get_db
-from .models import Upload as UploadModel, Analysis as AnalysisModel
-from .ocr_utils import file_to_text
-from .chunker import chunk_text
-from .llm_client import call_llm_for_topics
-from .aggregator import aggregate_topics
-from .config import Config
 from typing import List
-import shutil
-import uuid
-import pathlib
-import json
+from .config import Config
+from .processor import extract_text_from_file, basic_topic_heuristic
+from .llm_client import call_openrouter
+
+logger = logging.getLogger("app.routes")
+logger.setLevel(logging.INFO)
 
 router = APIRouter()
 
-# ensure upload dir exists
-pathlib.Path(Config.UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
+def ensure_upload_dir():
+    os.makedirs(Config.UPLOAD_DIR, exist_ok=True)
+    return Config.UPLOAD_DIR
 
 @router.get("/health")
 async def health():
     return JSONResponse({"status": "ok"})
 
-def allowed_upload_size(file: UploadFile):
-    # check size if needed (UploadFile doesn't expose size without reading)
-    return
+def _save_upload(upload: UploadFile) -> str:
+    updir = ensure_upload_dir()
+    fname = f"{uuid.uuid4().hex}_{upload.filename}"
+    dest = os.path.join(updir, fname)
+    with open(dest, "wb") as f:
+        shutil.copyfileobj(upload.file, f)
+    upload.file.close()
+    return dest
 
 @router.post("/analyze-llm")
-async def analyze_llm(file: UploadFile = File(...), db: Session = Depends(get_db)):
+async def analyze_llm(file: UploadFile = File(...)):
     """
-    Accepts single file. Returns JSON:
-    { "analysis_id": "<uuid>", "topicsMap": {...}, "summary": "...", "raw": {...} }
+    Accepts a single file in form field 'file'
     """
-
-    # save uploaded file to disk
     try:
-        uid = str(uuid.uuid4())
-        filename = f"{uid}_{file.filename}"
-        dst = str(pathlib.Path(Config.UPLOAD_DIR) / filename)
-        with open(dst, "wb") as out_f:
-            content = await file.read()
-            out_f.write(content)
+        path = _save_upload(file)
+        text = extract_text_from_file(path)
+        if not text:
+            # fallback message
+            text = f"[no text extracted from {file.filename}]"
+        # If DEMO_MODE, LLM client returns stub
+        llm_resp = call_openrouter(text)
+        # If LLM returned no topics, use fallback heuristic
+        topics = llm_resp.get("topicsMap") or basic_topic_heuristic(text)
+        return JSONResponse({
+            "analysis_id": None,
+            "topicsMap": topics,
+            "summary": llm_resp.get("summary"),
+            "raw": llm_resp.get("raw"),
+        })
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed saving upload: {e}")
-
-    try:
-        # OCR -> text pages
-        pages = file_to_text(dst)
-        # chunk and call LLM per file
-        chunks = []
-        for p in pages:
-            chunks.extend(chunk_text(p))
-        # If no chunks, create a minimal chunk
-        if not chunks:
-            chunks = [""]
-        # call LLM
-        llm_resp = call_llm_for_topics(chunks)
-        topics_map = llm_resp.get("topics_map", {})
-        summary = llm_resp.get("summary", "")
-        raw = llm_resp.get("raw", {})
-    except Exception as e:
-        # return a helpful 500 with trace in detail for dev
-        raise HTTPException(status_code=500, detail=str(e))
-
-    # persist upload metadata + analysis
-    try:
-        upload = UploadModel(filename=file.filename, content_type=file.content_type, size_bytes=len(content), storage_path=dst)
-        db.add(upload)
-        db.commit()
-        db.refresh(upload)
-
-        analysis = AnalysisModel(upload_ids=[upload.id], summary=summary, raw_response=raw, topics_map=topics_map, status="done")
-        db.add(analysis)
-        db.commit()
-        db.refresh(analysis)
-    except Exception as e:
-        # If DB fails, return result but warn
-        return JSONResponse(status_code=200, content={"analysis_id": None, "topicsMap": topics_map, "summary": summary, "raw": raw, "warning": f"DB save failed: {e}"})
-
-    return JSONResponse({"analysis_id": analysis.id, "topicsMap": topics_map, "summary": summary, "raw": raw})
+        logger.exception("Processing error for %s", getattr(file, "filename", "unknown"))
+        raise HTTPException(status_code=500, detail=f"Processing error for {getattr(file, 'filename', 'unknown')}: {e}")
 
 @router.post("/analyze-llm-batch")
-async def analyze_llm_batch(files: List[UploadFile] = File(...), db: Session = Depends(get_db)):
+async def analyze_llm_batch(files: List[UploadFile] = File(...)):
     """
-    Accepts multiple files in form 'files': file1, files: file2, ...
-    Aggregates topics across files and returns combined map.
+    Accepts multiple files in form field 'files'
     """
-    saved_uploads = []
-    per_file_topics = []
-    raw_agg = {"per_file": []}
-    for file in files:
-        try:
-            uid = str(uuid.uuid4())
-            filename = f"{uid}_{file.filename}"
-            dst = str(pathlib.Path(Config.UPLOAD_DIR) / filename)
-            with open(dst, "wb") as out_f:
-                content = await file.read()
-                out_f.write(content)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed saving upload {file.filename}: {e}")
-
-        # OCR + LLM per file
-        try:
-            pages = file_to_text(dst)
-            chunks = []
-            for p in pages:
-                chunks.extend(chunk_text(p))
-            if not chunks:
-                chunks = [""]
-            llm_resp = call_llm_for_topics(chunks)
-            topics_map = llm_resp.get("topics_map", {})
-            per_file_topics.append(topics_map)
-            raw_agg["per_file"].append({"filename": file.filename, "raw": llm_resp.get("raw")})
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Processing error for {file.filename}: {e}")
-
-        # save upload row
-        try:
-            upload = UploadModel(filename=file.filename, content_type=file.content_type, size_bytes=len(content), storage_path=dst)
-            db.add(upload)
-            db.commit()
-            db.refresh(upload)
-            saved_uploads.append(upload.id)
-        except Exception as e:
-            # continue but record warning
-            saved_uploads.append(None)
-
-    # aggregate
-    combined = aggregate_topics(per_file_topics)
-
-    # store analysis
+    saved = []
+    combined_text = []
     try:
-        analysis = AnalysisModel(upload_ids=saved_uploads, summary="Batch analysis", raw_response=raw_agg, topics_map=combined, status="done")
-        db.add(analysis)
-        db.commit()
-        db.refresh(analysis)
+        for f in files:
+            p = _save_upload(f)
+            saved.append(p)
+            txt = extract_text_from_file(p)
+            if txt:
+                combined_text.append(txt)
+        joined = "\n\n".join(combined_text)
+        if not joined:
+            joined = "[no text extracted from uploaded files]"
+        llm_resp = call_openrouter(joined)
+        topics = llm_resp.get("topicsMap") or basic_topic_heuristic(joined)
+        return JSONResponse({
+            "analysis_id": None,
+            "topicsMap": topics,
+            "summary": llm_resp.get("summary"),
+            "raw": llm_resp.get("raw"),
+        })
     except Exception as e:
-        return JSONResponse(status_code=200, content={"analysis_id": None, "topicsMap": combined, "summary": "", "raw": raw_agg, "warning": f"DB save failed: {e}"})
-
-    return JSONResponse({"analysis_id": analysis.id, "topicsMap": combined, "summary": "", "raw": raw_agg})
+        logger.exception("Processing error for batch")
+        raise HTTPException(status_code=500, detail=f"Processing error: {e}")
