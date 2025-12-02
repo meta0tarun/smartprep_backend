@@ -1,18 +1,19 @@
 # app/main.py
-import uvicorn
+import logging
 from fastapi import FastAPI
 from .routes import router
 from .config import Config
 
-app = FastAPI(title="SmartPrep Backend")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("app")
 
-app.include_router(router)
+def create_app():
+    app = FastAPI(title="SmartPrep Backend (MVP - No DB)")
+    app.include_router(router)
+    return app
 
-@app.on_event("startup")
-async def startup_event():
-    # create upload dir
-    import pathlib
-    pathlib.Path(Config.UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
+app = create_app()
 
 if __name__ == "__main__":
+    import uvicorn
     uvicorn.run("app.main:app", host=Config.HOST, port=Config.PORT, reload=True)
